@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Room Occupancy Dashboard</title>
+<style>
+:root{--bg:#e8ebe7;--ink:#17231f;--mute:#5d6b65;--card:#f6f7f4;--ok:#1f7a4d;--bad:#b3261e;--line:#c5ccc6}
+@media (prefers-color-scheme:dark){:root{--bg:#121917;--ink:#e6ece8;--mute:#93a39b;--card:#1b2420;--ok:#4cc38a;--bad:#ff7b72;--line:#33423b}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 "Segoe UI",system-ui,sans-serif;padding:20px}
+main{max-width:860px;margin:auto;display:grid;gap:16px}
+header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}
+h1{font-size:1.3rem;margin:0}
+button,input{font:inherit;color:inherit}
+button{background:var(--ink);color:var(--bg);border:0;border-radius:6px;padding:8px 14px;cursor:pointer}
+button.alt{background:transparent;color:var(--ink);border:1px solid var(--line)}
+button:focus-visible,input:focus-visible{outline:3px solid var(--ok);outline-offset:2px}
+.door{background:var(--card);border:2px solid var(--ink);border-radius:4px;display:grid;grid-template-columns:1fr 150px;min-height:240px}
+.count{padding:24px;display:flex;flex-direction:column;justify-content:center}
+.num{font-size:7rem;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.num small{font-size:2rem;color:var(--mute);font-weight:400}
+.bar{height:12px;background:var(--line);border-radius:6px;margin-top:16px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--ok);width:0;transition:width .3s,background .3s}
+.latch{border-left:2px solid var(--ink);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:12px;text-align:center;transition:background .3s}
+.latch.locked{background:color-mix(in srgb,var(--bad) 18%,transparent)}
+.bolt{width:90px;height:14px;background:var(--ink);border-radius:7px;transform-origin:left center;transition:transform .4s}
+.latch:not(.locked) .bolt{transform:rotate(-70deg) translateX(0)}
+.state{font-weight:700}
+.latch.locked .state{color:var(--bad)}.latch:not(.locked) .state{color:var(--ok)}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:16px}
+.card h2{font-size:1rem;margin:0 0 10px}
+.ctl{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+input[type=number]{width:70px;padding:7px;border:1px solid var(--line);border-radius:6px;background:transparent}
+#log{list-style:none;margin:0;padding:0;max-height:180px;overflow:auto;font-size:.9rem}
+#log li{padding:4px 0;border-bottom:1px solid var(--line)}
+.in{color:var(--ok)}.out{color:var(--mute)}.full{color:var(--bad)}
+#conn{color:var(--mute);font-size:.9rem}
+@media(max-width:620px){.door,.row{grid-template-columns:1fr}.latch{border-left:0;border-top:2px solid var(--ink)}.num{font-size:5rem}}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>Room occupancy</h1>
+  <div class="ctl"><span id="conn">Not connected (demo mode)</span><button id="connect">Connect Arduino</button></div>
+</header>
+
+<section class="door" aria-live="polite">
+  <div class="count">
+    <div class="num"><span id="n">0</span><small>/<span id="m">5</span> people</small></div>
+    <div class="bar"><i id="fill"></i></div>
+  </div>
+  <div class="latch" id="latch"><div class="bolt"></div><div class="state" id="lstate">Open</div></div>
+</section>
+
+<div class="row">
+  <section class="card">
+    <h2>Controls</h2>
+    <div class="ctl">
+      <label>Limit <input type="number" id="limit" min="1" max="99" value="5"></label>
+      <button id="setLimit">Set limit</button>
+      <button class="alt" id="reset">Reset count</button>
+    </div>
+    <h2 style="margin-top:16px">Simulate (demo mode only)</h2>
+    <div class="ctl"><button class="alt" id="simIn">Person enters</button><button class="alt" id="simOut">Person leaves</button></div>
+  </section>
+  <section class="card">
+    <h2>Activity</h2>
+    <ul id="log"><li class="out">Waiting for first crossing.</li></ul>
+  </section>
+</div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let st = {count:0, max:5, locked:false}, port, writer, live = false, first = true;
+
+function render(){
+  $('n').textContent = st.count; $('m').textContent = st.max;
+  const p = Math.min(100, st.count / st.max * 100);
+  $('fill').style.width = p + '%';
+  $('fill').style.background = st.locked ? 'var(--bad)' : 'var(--ok)';
+  $('latch').classList.toggle('locked', st.locked);
+  $('lstate').textContent = st.locked ? 'Locked: room full' : 'Open';
+}
+function log(txt, cls){
+  if (first){ $('log').innerHTML = ''; first = false; }
+  const li = document.createElement('li');
+  li.className = cls; li.textContent = new Date().toLocaleTimeString() + '  ' + txt;
+  $('log').prepend(li);
+}
+
+/* ---- Live mode: Web Serial (Chrome / Edge) ---- */
+async function connect(){
+  if (!('serial' in navigator)) return alert('Web Serial needs Chrome or Edge on desktop.');
+  try{
+    port = await navigator.serial.requestPort();
+    await port.open({baudRate:9600});
+    writer = port.writable.getWriter();
+    live = true; $('conn').textContent = 'Connected to Arduino'; $('connect').disabled = true;
+    const rd = port.readable.pipeThrough(new TextDecoderStream()).getReader();
+    let buf = '';
+    while (true){
+      const {value, done} = await rd.read(); if (done) break;
+      buf += value; const lines = buf.split('\n'); buf = lines.pop();
+      lines.forEach(parse);
+    }
+  }catch(e){ live = false; $('conn').textContent = 'Connection failed: ' + e.message; }
+}
+function parse(line){
+  line = line.trim(); const p = line.split(',');
+  if (p[0] === 'S'){
+    const was = st.locked;
+    st = {count:+p[1], max:+p[2], locked:p[3] === '1'};
+    render();
+    if (st.locked && !was) log('Room full: latch locked', 'full');
+    if (!st.locked && was) log('Space available: latch open', 'in');
+  } else if (p[0] === 'E') log(p[1] === 'IN' ? 'Person entered' : 'Person left', p[1] === 'IN' ? 'in' : 'out');
+}
+async function send(t){ if (live && writer) await writer.write(new TextEncoder().encode(t + '\n')); }
+
+/* ---- Demo mode: same logic as the Arduino ---- */
+function demo(delta){
+  if (live) return;
+  if (delta > 0 && st.locked) return log('Entry blocked: room full', 'full');
+  if (delta < 0 && st.count === 0) return;
+  st.count += delta; st.locked = st.count >= st.max; render();
+  log(delta > 0 ? 'Person entered' : 'Person left', delta > 0 ? 'in' : 'out');
+  if (st.locked) log('Room full: latch locked', 'full');
+}
+
+$('connect').onclick = connect;
+$('simIn').onclick = () => demo(1);
+$('simOut').onclick = () => demo(-1);
+$('setLimit').onclick = () => {
+  const v = Math.max(1, Math.min(99, +$('limit').value || 5));
+  if (live) send('M' + v); else { st.max = v; st.locked = st.count >= v; render(); }
+  log('Limit set to ' + v, 'out');
+};
+$('reset').onclick = () => { if (live) send('R'); else { st.count = 0; st.locked = false; render(); } log('Count reset', 'out'); };
+render();
+</script>
+</body>
+</html>
